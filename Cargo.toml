@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+dashmap = "5.4.0"
 fastrand = "1.9.0"
-hashbrown = { version = "0.13" }
+lazy_static = "1.4.0"
 nix = { version = "0.26" }
 
 
