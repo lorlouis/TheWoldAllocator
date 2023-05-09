@@ -23,7 +23,7 @@ lazy_static! {
 
 pub struct TheWorld;
 
-const TOP_USIZE_BIT_MASK: usize = 1 << (mem::size_of::<usize>()-1);
+const TOP_USIZE_BIT_MASK: usize = 0b101 << (mem::size_of::<usize>()-3);
 
 // stolen from dhat-rs
 struct IgnoreAllocs {
@@ -108,7 +108,7 @@ unsafe impl GlobalAlloc for TheWorld {
 
         let atomic_ptr: *mut u64 = ptr::read(ptr as *const *mut u64);
 
-        if atomic_ptr as usize & TOP_USIZE_BIT_MASK != 0 {
+        if atomic_ptr as usize & TOP_USIZE_BIT_MASK == TOP_USIZE_BIT_MASK {
             let counter = AtomicU64::from_ptr(atomic_ptr);
             let mut buffer = Vec::new_in(System);
             writeln!(&mut buffer, "free: {:x}, ptr: {:x}\n", atomic_ptr as usize, ptr as usize);
