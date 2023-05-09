@@ -23,6 +23,8 @@ lazy_static! {
 
 pub struct TheWorld;
 
+const TOP_USIZE_BIT_MASK: usize = 1 << (mem::size_of::<usize>()-1);
+
 // stolen from dhat-rs
 struct IgnoreAllocs {
     was_already_ignoring_allocs: bool,
@@ -91,7 +93,7 @@ unsafe impl GlobalAlloc for TheWorld {
                 ptr::null_mut()
             };
 
-            ptr::write(alloc as *mut usize, atomic_ptr as usize);
+            ptr::write(alloc as *mut usize, atomic_ptr as usize | TOP_USIZE_BIT_MASK as usize);
         }
 
         alloc.add(alloc_surplus)
@@ -106,7 +108,7 @@ unsafe impl GlobalAlloc for TheWorld {
 
         let atomic_ptr: *mut u64 = ptr::read(ptr as *const *mut u64);
 
-        if !atomic_ptr.is_null() {
+        if atomic_ptr as usize & TOP_USIZE_BIT_MASK != 0 {
             let counter = AtomicU64::from_ptr(atomic_ptr);
             let mut buffer = Vec::new_in(System);
             writeln!(&mut buffer, "free: {:x}, ptr: {:x}\n", atomic_ptr as usize, ptr as usize);
