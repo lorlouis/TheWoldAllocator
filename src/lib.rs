@@ -3,27 +3,49 @@
 
 use std::alloc::{GlobalAlloc, System, Layout};
 
-use std::mem;
-use std::ptr;
-use lazy_static::lazy_static;
-use std::backtrace::Backtrace;
-use std::sync::atomic::{AtomicU64, Ordering};
+use backtrace::Backtrace;
+
 use std::cell::Cell;
-use std::time::{SystemTime, UNIX_EPOCH};
-use nix::unistd;
-use std::sync::Mutex;
-use std::io::Write;
 
-use hashbrown::{HashMap, hash_map::DefaultHashBuilder};
+use lazy_static::lazy_static;
 
+use std::sync::{Mutex, MutexGuard, PoisonError, atomic::{AtomicUsize, Ordering}};
+
+use lockfree::map::Map;
+
+use std::collections::BTreeMap;
+
+const SAMPLE_EVERY: usize = 512 * 1024;
+
+static ALLOC_SIZE: Mutex<usize> = Mutex::new(0);
 
 lazy_static! {
-    static ref ALLOC_STATE: Mutex<HashMap<Vec<u8, System>, Box<AtomicU64, System>, DefaultHashBuilder, System>> = Mutex::new(HashMap::new_in(System));
+    static ref BT_TO_ATOMIC: Mutex<BTreeMap<Backtrace, AtomicUsize>> = Mutex::new(BTreeMap::default());
+
+    static ref ALLOC_PTR_TO_ATOMIC_PTR: Map<usize, usize> = Map::default();
+}
+
+trait IgnorePoison {
+    type Inner;
+    fn lock_ingore_poison(&self) -> MutexGuard<Self::Inner>;
+}
+
+impl<T> IgnorePoison for Mutex<T> {
+    type Inner = T;
+
+    fn lock_ingore_poison(&self) -> MutexGuard<Self::Inner> {
+        match self.lock() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("lock poisoned: {}, continuing", e);
+                e.into_inner()
+            }
+        }
+    }
+
 }
 
 pub struct TheWorld;
-
-const TOP_USIZE_BIT_MASK: usize = 0b101 << (mem::size_of::<usize>()-3);
 
 // stolen from dhat-rs
 struct IgnoreAllocs {
@@ -32,12 +54,6 @@ struct IgnoreAllocs {
 
 thread_local!{
     static IGNORE_ALLOCS: Cell<bool> = Cell::new(false);
-    static RNG: fastrand::Rng = fastrand::Rng::with_seed(
-        SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_nanos() as u64)
-        .unwrap_or(4)
-    );
 }
 
 impl IgnoreAllocs {
@@ -57,65 +73,59 @@ impl std::ops::Drop for IgnoreAllocs {
 }
 // end of the stolen code
 
+impl TheWorld {
+    pub fn serialize_state() -> String {
+        todo!()
+    }
+}
+
 unsafe impl GlobalAlloc for TheWorld {
 
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ignore_allocs = IgnoreAllocs::new();
+        let ignore_alloc = IgnoreAllocs::new();
+        let sys_alloc = System.alloc(layout);
 
-        let alloc_surplus = layout.align().max(mem::size_of::<*const usize>());
-        let layout = Layout::from_size_align_unchecked(
-            layout.size() + alloc_surplus,
-            layout.align().max(mem::align_of::<*const u64>()),
-        );
 
-        let alloc = System.alloc(layout);
-        if ignore_allocs.was_already_ignoring_allocs {
-            alloc.write_bytes(0, mem::size_of::<*const u64>());
-        }
-        else {
-            let rng = RNG.with(|rng| rng.i32(0..100));
+        {
+            //let cur_alloc_size = ALLOC_SIZE.lock();
+            if ignore_alloc.was_already_ignoring_allocs {
+                return sys_alloc
+            }
 
-            let atomic_ptr = if rng <= 3 {
-                let mut buffer = Vec::new_in(System);
-                write!(&mut buffer, "{}", Backtrace::capture().to_string()).unwrap();
-                let ptr = ALLOC_STATE.lock().unwrap().entry(buffer)
-                    .or_insert_with(|| Box::new_in(AtomicU64::new(0), System)).as_ptr();
-
-                let counter = AtomicU64::from_ptr(ptr);
-                counter.fetch_add(1, Ordering::Relaxed);
-
-                let mut buffer = Vec::new_in(System);
-                writeln!(&mut buffer, "alloc: {:x}, ptr: {:x}\n", ptr as usize, alloc.add(alloc_surplus) as usize);
-                unistd::write(2, &buffer);
-
-                ptr
-            } else {
-                ptr::null_mut()
-            };
-
-            ptr::write(alloc as *mut usize, atomic_ptr as usize | TOP_USIZE_BIT_MASK as usize);
+            if *cur_alloc_size > SAMPLE_EVERY {
+                *cur_alloc_size = 0;
+                return sys_alloc;
+            }
         }
 
-        alloc.add(alloc_surplus)
+
+        /*
+        // TODO(louis) sample
+        let bt = Backtrace::new();
+
+        let atomic_ptr = {
+            let mut state = BT_TO_ATOMIC.lock_ingore_poison();
+            let atomic_ptr = state.entry(bt).or_default().as_ptr();
+            atomic_ptr
+        };
+        ALLOC_PTR_TO_ATOMIC_PTR.insert(sys_alloc as usize, atomic_ptr as usize);
+
+        let atomic = AtomicUsize::from_ptr(atomic_ptr);
+        atomic.fetch_add(1, Ordering::Relaxed);
+        */
+        sys_alloc
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let alloc_surplus = layout.align().max(mem::size_of::<*const ()>());
-        let layout = Layout::from_size_align_unchecked(
-            layout.size() + alloc_surplus,
-            layout.align().max(mem::align_of::<*const ()>()),
-        );
-
-        let atomic_ptr: *mut u64 = ptr::read(ptr as *const *mut u64);
-
-        if atomic_ptr as usize & TOP_USIZE_BIT_MASK == TOP_USIZE_BIT_MASK {
-            let counter = AtomicU64::from_ptr(atomic_ptr);
-            let mut buffer = Vec::new_in(System);
-            writeln!(&mut buffer, "free: {:x}, ptr: {:x}\n", atomic_ptr as usize, ptr as usize);
-            unistd::write(2, &buffer);
-            counter.fetch_sub(1, Ordering::Relaxed);
+        /*
+        {
+            if let Some(atomic_ptr) = ALLOC_PTR_TO_ATOMIC_PTR.remove(&(ptr as usize)) {
+                let atomic = AtomicUsize::from_ptr((*atomic_ptr.val()) as *mut usize);
+                let _value = atomic.fetch_sub(1, Ordering::Relaxed);
+                // TODO(louis) check is value is 1 and free (Backtrace, AtomicUsize)
+            }
         }
-
-        System.dealloc(ptr.sub(alloc_surplus), layout);
+        */
+        System.dealloc(ptr, layout);
     }
 }
